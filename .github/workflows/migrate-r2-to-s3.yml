@@ -3,8 +3,8 @@ name: Migrate R2 to S3
 on:
   workflow_dispatch:
     inputs:
-      folder:
-        description: "Folder/prefix in the R2 bucket to migrate (e.g. backups/2024/)"
+      folders:
+        description: "Folders/prefixes to migrate — one per line or comma-separated (e.g. backups/2024/\nuploads/images/)"
         required: true
         type: string
       workers:
@@ -53,11 +53,17 @@ jobs:
           CF_R2_ENDPOINT_URL: ${{ secrets.CF_R2_ENDPOINT_URL }}
           S3_BUCKET_NAME: ${{ secrets.S3_BUCKET_NAME }}
         run: |
-          args=(
-            --prefix "${{ inputs.folder }}"
-            --workers "${{ inputs.workers }}"
-          )
+          args=(--workers "${{ inputs.workers }}")
           [[ "${{ inputs.dry_run }}"       == "true" ]] && args+=(--dry-run)
           [[ "${{ inputs.skip_existing }}" == "true" ]] && args+=(--skip-existing)
+
+          # Split folders on newlines and commas, strip whitespace, skip blanks
+          while IFS= read -r line; do
+            IFS=',' read -ra parts <<< "$line"
+            for part in "${parts[@]}"; do
+              part="${part// /}"   # trim spaces
+              [[ -n "$part" ]] && args+=(--prefix "$part")
+            done
+          done <<< "${{ inputs.folders }}"
 
           python scripts/mig_r2_s3.py "${args[@]}"

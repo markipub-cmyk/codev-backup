@@ -41,7 +41,7 @@ _thread_local = threading.local()
 
 @dataclass
 class Args:
-    prefix: str
+    prefixes: list[str]
     dry_run: bool
     skip_existing: bool
     workers: int
@@ -196,44 +196,48 @@ def migrate(args: Args) -> Stats:
 
     source_bucket = os.environ["CF_R2_BUCKET_NAME"]
     dest_bucket = os.environ["S3_BUCKET_NAME"]
-    prefix = normalize_prefix(args.prefix)
+    prefixes = [normalize_prefix(p) for p in args.prefixes]
 
-    print(f"Source : r2://{source_bucket}/{prefix}")
-    print(f"Dest   : s3://{dest_bucket}/{prefix}")
     print(f"Workers: {args.workers}  |  dry-run: {args.dry_run}  |  skip-existing: {args.skip_existing}")
+    print(f"Prefixes ({len(prefixes)}):")
+    for p in prefixes:
+        print(f"  r2://{source_bucket}/{p}  →  s3://{dest_bucket}/{p}")
     print()
 
     stats = Stats()
 
-    # ── dry-run: just list ──────────────────────────────
-    if args.dry_run:
-        for key, size in list_objects(source_bucket, prefix):
-            stats.inc("listed")
-            print(f"  {key}  ({size / 1024:.1f} KiB)")
-        return stats
+    for prefix in prefixes:
+        print(f"── prefix: {prefix or '(root)'} ──")
 
-    # ── real copy: feed pool as objects are listed ──────
-    with ThreadPoolExecutor(max_workers=args.workers) as pool:
-        futures = {}
+        # ── dry-run: just list ──────────────────────────────
+        if args.dry_run:
+            for key, size in list_objects(source_bucket, prefix):
+                stats.inc("listed")
+                print(f"  {key}  ({size / 1024:.1f} KiB)")
+            continue
 
-        for key, size in list_objects(source_bucket, prefix):
-            stats.inc("listed")
-            fut = pool.submit(
-                _process,
-                key, size,
-                source_bucket, dest_bucket,
-                args.skip_existing, stats,
-            )
-            futures[fut] = (key, size)
+        # ── real copy: feed pool as objects are listed ──────
+        with ThreadPoolExecutor(max_workers=args.workers) as pool:
+            futures = {}
 
-        for fut in as_completed(futures):
-            key, size = futures[fut]
-            try:
-                _, outcome = fut.result()
-            except Exception as exc:  # noqa: BLE001
-                outcome = f"failed: {exc}"
-            size_label = f"{size / 1024:.1f} KiB"
-            print(f"  [{outcome}] {key} ({size_label})")
+            for key, size in list_objects(source_bucket, prefix):
+                stats.inc("listed")
+                fut = pool.submit(
+                    _process,
+                    key, size,
+                    source_bucket, dest_bucket,
+                    args.skip_existing, stats,
+                )
+                futures[fut] = (key, size)
+
+            for fut in as_completed(futures):
+                key, size = futures[fut]
+                try:
+                    _, outcome = fut.result()
+                except Exception as exc:  # noqa: BLE001
+                    outcome = f"failed: {exc}"
+                size_label = f"{size / 1024:.1f} KiB"
+                print(f"  [{outcome}] {key} ({size_label})")
 
     return stats
 
@@ -244,8 +248,10 @@ def migrate(args: Args) -> Stats:
 
 def parse_args() -> Args:
     p = argparse.ArgumentParser(description="Migrate objects from Cloudflare R2 to AWS S3.")
-    p.add_argument("--prefix", required=True,
-                   help="R2 folder/prefix to migrate (e.g. backups/2024/).")
+    p.add_argument("--prefix", dest="prefixes", action="append", required=True,
+                   metavar="PREFIX",
+                   help="R2 folder/prefix to migrate (e.g. backups/2024/). "
+                        "Repeat the flag to migrate multiple prefixes in one run.")
     p.add_argument("--dry-run", action="store_true",
                    help="List matching objects without copying.")
     p.add_argument("--skip-existing", action="store_true",
@@ -254,7 +260,7 @@ def parse_args() -> Args:
                    help="Parallel copy threads (default: 20).")
     ns = p.parse_args()
     return Args(
-        prefix=ns.prefix,
+        prefixes=ns.prefixes,
         dry_run=ns.dry_run,
         skip_existing=ns.skip_existing,
         workers=ns.workers,
