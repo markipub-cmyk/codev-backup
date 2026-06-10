@@ -1,0 +1,58 @@
+name: Migrate R2 to S3
+
+on:
+  workflow_dispatch:
+    inputs:
+      folder:
+        description: "Folder/prefix in the R2 bucket to migrate (e.g. backups/2024/)"
+        required: true
+        type: string
+      dry_run:
+        description: "List objects only; do not copy to S3"
+        required: false
+        type: boolean
+        default: false
+      skip_existing:
+        description: "Skip objects that already exist in the destination S3 bucket"
+        required: false
+        type: boolean
+        default: true
+
+jobs:
+  migrate:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Migrate R2 prefix to S3
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          CF_R2_ACCESS_KEY_ID: ${{ secrets.CF_R2_ACCESS_KEY_ID }}
+          CF_R2_SECRET_ACCESS_KEY: ${{ secrets.CF_R2_SECRET_ACCESS_KEY }}
+          CF_R2_BUCKET_NAME: ${{ secrets.CF_R2_BUCKET_NAME }}
+          CF_R2_ENDPOINT_URL: ${{ secrets.CF_R2_ENDPOINT_URL }}
+          S3_BUCKET_NAME: ${{ secrets.S3_BUCKET_NAME }}
+        run: |
+          args=(--prefix "${{ inputs.folder }}")
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            args+=(--dry-run)
+          fi
+          if [ "${{ inputs.skip_existing }}" = "true" ]; then
+            args+=(--skip-existing)
+          fi
+          python scripts/mig_r2_to_s3.py "${args[@]}"
