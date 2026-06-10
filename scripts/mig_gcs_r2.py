@@ -197,10 +197,12 @@ def migrate(args: Args) -> Stats:
 
     gcs_bucket = os.environ["GCS_BUCKET_NAME"]
     r2_bucket  = os.environ["CF_R2_BUCKET_NAME2"]
-    prefix     = normalize_prefix(args.prefix)
+    prefix     = normalize_prefix(args.prefix) if args.prefix else ""
 
-    print(f"Source : gs://{gcs_bucket}/{prefix}")
-    print(f"Dest   : r2://{r2_bucket}/{prefix}")
+    source = f"gs://{gcs_bucket}/" + prefix if prefix else f"gs://{gcs_bucket}"
+    dest   = f"r2://{r2_bucket}/" + prefix if prefix else f"r2://{r2_bucket}"
+    print(f"Source : {source}")
+    print(f"Dest   : {dest}")
     print(f"Workers: {args.workers}  |  dry-run: {args.dry_run}  |  skip-existing: {args.skip_existing}")
     print()
 
@@ -244,8 +246,8 @@ def migrate(args: Args) -> Stats:
 
 def parse_args() -> Args:
     p = argparse.ArgumentParser(description="Migrate objects from GCS to Cloudflare R2.")
-    p.add_argument("--prefix", required=True,
-                   help="GCS folder/prefix to migrate (e.g. backups/2024/).")
+    p.add_argument("--prefix", default="",
+                   help="Optional GCS prefix to limit scope (default: entire bucket).")
     p.add_argument("--dry-run", action="store_true",
                    help="List matching objects without copying.")
     p.add_argument("--skip-existing", action="store_true",

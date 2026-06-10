@@ -3,10 +3,6 @@ name: Migrate GCS to R2
 on:
   workflow_dispatch:
     inputs:
-      folder:
-        description: "Folder/prefix in the GCS bucket to migrate (e.g. backups/2024/)"
-        required: true
-        type: string
       workers:
         description: "Parallel copy threads (default: 20)"
         required: false
@@ -43,7 +39,7 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Migrate GCS prefix to R2
+      - name: Migrate GCS bucket to R2
         env:
           # ── GCS source ──────────────────────────────────
           GCS_BUCKET_NAME: ${{ secrets.GCS_BUCKET_NAME }}
@@ -54,10 +50,7 @@ jobs:
           CF_R2_BUCKET_NAME2: ${{ secrets.CF_R2_BUCKET_NAME2 }}
           CF_R2_ENDPOINT_URL2: ${{ secrets.CF_R2_ENDPOINT_URL2 }}
         run: |
-          args=(
-            --prefix "${{ inputs.folder }}"
-            --workers "${{ inputs.workers }}"
-          )
+          args=(--workers "${{ inputs.workers }}")
           [[ "${{ inputs.dry_run }}"       == "true" ]] && args+=(--dry-run)
           [[ "${{ inputs.skip_existing }}" == "true" ]] && args+=(--skip-existing)
 
