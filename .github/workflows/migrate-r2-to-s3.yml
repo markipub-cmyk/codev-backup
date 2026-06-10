@@ -55,4 +55,4 @@ jobs:
           if [ "${{ inputs.skip_existing }}" = "true" ]; then
             args+=(--skip-existing)
           fi
-          python scripts/mig_r2_to_s3.py "${args[@]}"
+          python scripts/mig_r2_s3.py "${args[@]}"
