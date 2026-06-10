@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
-"""Copy objects from a Cloudflare R2 bucket prefix to an AWS S3 bucket."""
+"""Migrate objects from Cloudflare R2 to AWS S3 with parallel streaming transfers."""
 
 from __future__ import annotations
 
 import argparse
 import os
 import sys
-from dataclasses import dataclass
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field
+from typing import Iterator
 
 import boto3
+from boto3.s3.transfer import TransferConfig
 from botocore.config import Config
 from botocore.exceptions import ClientError
 
@@ -23,14 +27,84 @@ REQUIRED_ENV = (
     "S3_BUCKET_NAME",
 )
 
+# 8 MiB multipart chunk; files above this are uploaded in parallel parts.
+MULTIPART_THRESHOLD = 8 * 1024 * 1024
+MULTIPART_CHUNKSIZE = 8 * 1024 * 1024
+
+# boto3 S3 clients are not thread-safe; keep one per thread.
+_thread_local = threading.local()
+
+
+# ──────────────────────────────────────────────
+# Data
+# ──────────────────────────────────────────────
 
 @dataclass
-class MigrationStats:
+class Args:
+    prefix: str
+    dry_run: bool
+    skip_existing: bool
+    workers: int
+
+
+@dataclass
+class Stats:
+    lock: threading.Lock = field(default_factory=threading.Lock)
     listed: int = 0
     copied: int = 0
     skipped: int = 0
     failed: int = 0
 
+    def inc(self, field_name: str) -> None:
+        with self.lock:
+            setattr(self, field_name, getattr(self, field_name) + 1)
+
+
+# ──────────────────────────────────────────────
+# Client helpers (thread-local)
+# ──────────────────────────────────────────────
+
+def _r2() -> boto3.client:
+    if not hasattr(_thread_local, "r2"):
+        _thread_local.r2 = boto3.client(
+            "s3",
+            endpoint_url=os.environ["CF_R2_ENDPOINT_URL"],
+            aws_access_key_id=os.environ["CF_R2_ACCESS_KEY_ID"],
+            aws_secret_access_key=os.environ["CF_R2_SECRET_ACCESS_KEY"],
+            config=Config(
+                signature_version="s3v4",
+                retries={"max_attempts": 5, "mode": "adaptive"},
+                max_pool_connections=50,
+            ),
+        )
+    return _thread_local.r2
+
+
+def _s3() -> boto3.client:
+    if not hasattr(_thread_local, "s3"):
+        _thread_local.s3 = boto3.client(
+            "s3",
+            aws_access_key_id=os.environ["AWS_ACCESS_KEY_ID"],
+            aws_secret_access_key=os.environ["AWS_SECRET_ACCESS_KEY"],
+            config=Config(
+                retries={"max_attempts": 5, "mode": "adaptive"},
+                max_pool_connections=50,
+            ),
+        )
+    return _thread_local.s3
+
+
+_transfer_config = TransferConfig(
+    multipart_threshold=MULTIPART_THRESHOLD,
+    multipart_chunksize=MULTIPART_CHUNKSIZE,
+    max_concurrency=4,         # parallel parts per large file
+    use_threads=True,
+)
+
+
+# ──────────────────────────────────────────────
+# Core helpers
+# ──────────────────────────────────────────────
 
 def normalize_prefix(prefix: str) -> str:
     prefix = prefix.strip().lstrip("/")
@@ -40,141 +114,164 @@ def normalize_prefix(prefix: str) -> str:
 
 
 def validate_env() -> None:
-    missing = [name for name in REQUIRED_ENV if not os.environ.get(name)]
+    missing = [v for v in REQUIRED_ENV if not os.environ.get(v)]
     if missing:
-        print("Missing required environment variables:", ", ".join(missing), file=sys.stderr)
-        sys.exit(1)
+        sys.exit("Missing environment variables: " + ", ".join(missing))
 
 
-def r2_client():
-    return boto3.client(
-        "s3",
-        endpoint_url=os.environ["CF_R2_ENDPOINT_URL"],
-        aws_access_key_id=os.environ["CF_R2_ACCESS_KEY_ID"],
-        aws_secret_access_key=os.environ["CF_R2_SECRET_ACCESS_KEY"],
-        config=Config(signature_version="s3v4"),
-    )
-
-
-def s3_client():
-    return boto3.client(
-        "s3",
-        aws_access_key_id=os.environ["AWS_ACCESS_KEY_ID"],
-        aws_secret_access_key=os.environ["AWS_SECRET_ACCESS_KEY"],
-    )
-
-
-def iter_r2_objects(client, bucket: str, prefix: str):
-    paginator = client.get_paginator("list_objects_v2")
+def list_objects(bucket: str, prefix: str) -> Iterator[tuple[str, int]]:
+    """Yield (key, size) for every real object under prefix."""
+    paginator = _r2().get_paginator("list_objects_v2")
     for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
         for obj in page.get("Contents", []):
             key = obj["Key"]
-            if key.endswith("/"):
-                continue
-            yield key, obj.get("Size", 0)
+            if not key.endswith("/"):
+                yield key, obj.get("Size", 0)
 
 
-def s3_object_exists(client, bucket: str, key: str) -> bool:
+def exists_in_s3(bucket: str, key: str) -> bool:
     try:
-        client.head_object(Bucket=bucket, Key=key)
+        _s3().head_object(Bucket=bucket, Key=key)
         return True
     except ClientError as exc:
-        if exc.response["Error"]["Code"] in {"404", "NoSuchKey", "NotFound"}:
+        code = exc.response["Error"]["Code"]
+        if code in {"404", "NoSuchKey", "NotFound"}:
             return False
         raise
 
 
-def copy_object(r2, s3, source_bucket: str, dest_bucket: str, key: str) -> None:
-    response = r2.get_object(Bucket=source_bucket, Key=key)
-    body = response["Body"].read()
+def stream_copy(source_bucket: str, dest_bucket: str, key: str) -> None:
+    """Stream an object from R2 straight into S3 (no full-memory buffer)."""
+    response = _r2().get_object(Bucket=source_bucket, Key=key)
+    body = response["Body"]          # streaming; not yet read into memory
 
-    put_args = {
-        "Bucket": dest_bucket,
-        "Key": key,
-        "Body": body,
-    }
+    extra: dict = {}
+    ct = response.get("ContentType")
+    if ct:
+        extra["ContentType"] = ct
+    meta = response.get("Metadata")
+    if meta:
+        extra["Metadata"] = meta
 
-    content_type = response.get("ContentType")
-    if content_type:
-        put_args["ContentType"] = content_type
-
-    metadata = response.get("Metadata")
-    if metadata:
-        put_args["Metadata"] = metadata
-
-    s3.put_object(**put_args)
+    _s3().upload_fileobj(
+        body,
+        dest_bucket,
+        key,
+        ExtraArgs=extra or None,
+        Config=_transfer_config,
+    )
 
 
-def migrate(prefix: str, dry_run: bool, skip_existing: bool) -> MigrationStats:
+# ──────────────────────────────────────────────
+# Per-object task (runs in thread pool)
+# ──────────────────────────────────────────────
+
+def _process(
+    key: str,
+    size: int,
+    source_bucket: str,
+    dest_bucket: str,
+    skip_existing: bool,
+    stats: Stats,
+) -> tuple[str, str]:
+    """Returns (key, outcome) where outcome is 'copied' | 'skipped' | 'failed:<msg>'."""
+    try:
+        if skip_existing and exists_in_s3(dest_bucket, key):
+            stats.inc("skipped")
+            return key, "skipped"
+        stream_copy(source_bucket, dest_bucket, key)
+        stats.inc("copied")
+        return key, "copied"
+    except Exception as exc:  # noqa: BLE001
+        stats.inc("failed")
+        return key, f"failed: {exc}"
+
+
+# ──────────────────────────────────────────────
+# Main migration
+# ──────────────────────────────────────────────
+
+def migrate(args: Args) -> Stats:
     validate_env()
 
     source_bucket = os.environ["CF_R2_BUCKET_NAME"]
     dest_bucket = os.environ["S3_BUCKET_NAME"]
-    prefix = normalize_prefix(prefix)
+    prefix = normalize_prefix(args.prefix)
 
-    r2 = r2_client()
-    s3 = s3_client()
-    stats = MigrationStats()
-
-    print(f"Source: r2://{source_bucket}/{prefix or ''}")
-    print(f"Destination: s3://{dest_bucket}/{prefix or ''}")
-    print(f"Mode: {'dry-run' if dry_run else 'copy'}")
+    print(f"Source : r2://{source_bucket}/{prefix}")
+    print(f"Dest   : s3://{dest_bucket}/{prefix}")
+    print(f"Workers: {args.workers}  |  dry-run: {args.dry_run}  |  skip-existing: {args.skip_existing}")
     print()
 
-    for key, size in iter_r2_objects(r2, source_bucket, prefix):
-        stats.listed += 1
-        size_kb = size / 1024
-        print(f"[{stats.listed}] {key} ({size_kb:.1f} KiB)")
+    stats = Stats()
 
-        if dry_run:
-            continue
+    # ── dry-run: just list ──────────────────────────────
+    if args.dry_run:
+        for key, size in list_objects(source_bucket, prefix):
+            stats.inc("listed")
+            print(f"  {key}  ({size / 1024:.1f} KiB)")
+        return stats
 
-        if skip_existing and s3_object_exists(s3, dest_bucket, key):
-            print("  -> skipped (already exists in S3)")
-            stats.skipped += 1
-            continue
+    # ── real copy: feed pool as objects are listed ──────
+    with ThreadPoolExecutor(max_workers=args.workers) as pool:
+        futures = {}
 
-        try:
-            copy_object(r2, s3, source_bucket, dest_bucket, key)
-            print("  -> copied")
-            stats.copied += 1
-        except ClientError as exc:
-            print(f"  -> failed: {exc}", file=sys.stderr)
-            stats.failed += 1
+        for key, size in list_objects(source_bucket, prefix):
+            stats.inc("listed")
+            fut = pool.submit(
+                _process,
+                key, size,
+                source_bucket, dest_bucket,
+                args.skip_existing, stats,
+            )
+            futures[fut] = (key, size)
+
+        for fut in as_completed(futures):
+            key, size = futures[fut]
+            try:
+                _, outcome = fut.result()
+            except Exception as exc:  # noqa: BLE001
+                outcome = f"failed: {exc}"
+            size_label = f"{size / 1024:.1f} KiB"
+            print(f"  [{outcome}] {key} ({size_label})")
 
     return stats
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Migrate objects from Cloudflare R2 to AWS S3.")
-    parser.add_argument(
-        "--prefix",
-        required=True,
-        help="Folder/prefix inside the R2 bucket to migrate (e.g. backups/2024/).",
+# ──────────────────────────────────────────────
+# CLI
+# ──────────────────────────────────────────────
+
+def parse_args() -> Args:
+    p = argparse.ArgumentParser(description="Migrate objects from Cloudflare R2 to AWS S3.")
+    p.add_argument("--prefix", required=True,
+                   help="R2 folder/prefix to migrate (e.g. backups/2024/).")
+    p.add_argument("--dry-run", action="store_true",
+                   help="List matching objects without copying.")
+    p.add_argument("--skip-existing", action="store_true",
+                   help="Skip objects already present in the S3 bucket.")
+    p.add_argument("--workers", type=int, default=20,
+                   help="Parallel copy threads (default: 20).")
+    ns = p.parse_args()
+    return Args(
+        prefix=ns.prefix,
+        dry_run=ns.dry_run,
+        skip_existing=ns.skip_existing,
+        workers=ns.workers,
     )
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="List matching objects without copying them.",
-    )
-    parser.add_argument(
-        "--skip-existing",
-        action="store_true",
-        help="Skip objects that already exist in the destination S3 bucket.",
-    )
-    return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
-    stats = migrate(prefix=args.prefix, dry_run=args.dry_run, skip_existing=args.skip_existing)
+    stats = migrate(args)
 
     print()
-    print("Summary")
-    print(f"  Listed:   {stats.listed}")
-    print(f"  Copied:   {stats.copied}")
-    print(f"  Skipped:  {stats.skipped}")
-    print(f"  Failed:   {stats.failed}")
+    print("─" * 32)
+    print(f"  Listed : {stats.listed}")
+    print(f"  Copied : {stats.copied}")
+    print(f"  Skipped: {stats.skipped}")
+    print(f"  Failed : {stats.failed}")
+    print("─" * 32)
 
     return 1 if stats.failed else 0
 

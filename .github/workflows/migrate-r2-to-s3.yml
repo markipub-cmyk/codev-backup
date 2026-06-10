@@ -7,13 +7,18 @@ on:
         description: "Folder/prefix in the R2 bucket to migrate (e.g. backups/2024/)"
         required: true
         type: string
+      workers:
+        description: "Parallel copy threads (default: 20)"
+        required: false
+        type: string
+        default: "20"
       dry_run:
-        description: "List objects only; do not copy to S3"
+        description: "List objects only — do not copy to S3"
         required: false
         type: boolean
         default: false
       skip_existing:
-        description: "Skip objects that already exist in the destination S3 bucket"
+        description: "Skip objects already present in the S3 bucket"
         required: false
         type: boolean
         default: true
@@ -48,11 +53,11 @@ jobs:
           CF_R2_ENDPOINT_URL: ${{ secrets.CF_R2_ENDPOINT_URL }}
           S3_BUCKET_NAME: ${{ secrets.S3_BUCKET_NAME }}
         run: |
-          args=(--prefix "${{ inputs.folder }}")
-          if [ "${{ inputs.dry_run }}" = "true" ]; then
-            args+=(--dry-run)
-          fi
-          if [ "${{ inputs.skip_existing }}" = "true" ]; then
-            args+=(--skip-existing)
-          fi
+          args=(
+            --prefix "${{ inputs.folder }}"
+            --workers "${{ inputs.workers }}"
+          )
+          [[ "${{ inputs.dry_run }}"       == "true" ]] && args+=(--dry-run)
+          [[ "${{ inputs.skip_existing }}" == "true" ]] && args+=(--skip-existing)
+
           python scripts/mig_r2_s3.py "${args[@]}"
