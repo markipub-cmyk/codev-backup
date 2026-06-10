@@ -1,0 +1,64 @@
+name: Migrate GCS to R2
+
+on:
+  workflow_dispatch:
+    inputs:
+      folder:
+        description: "Folder/prefix in the GCS bucket to migrate (e.g. backups/2024/)"
+        required: true
+        type: string
+      workers:
+        description: "Parallel copy threads (default: 20)"
+        required: false
+        type: string
+        default: "20"
+      dry_run:
+        description: "List objects only — do not copy to R2"
+        required: false
+        type: boolean
+        default: false
+      skip_existing:
+        description: "Skip objects already present in the R2 bucket"
+        required: false
+        type: boolean
+        default: true
+
+jobs:
+  migrate:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Migrate GCS prefix to R2
+        env:
+          # ── GCS source ──────────────────────────────────
+          GCS_BUCKET_NAME: ${{ secrets.GCS_BUCKET_NAME }}
+          GCS_SERVICE_ACCOUNT_KEY: ${{ secrets.GCS_SERVICE_ACCOUNT_KEY }}
+          # ── Cloudflare R2 destination ───────────────────
+          CF_R2_ACCESS_KEY_ID2: ${{ secrets.CF_R2_ACCESS_KEY_ID2 }}
+          CF_R2_SECRET_ACCESS_KEY2: ${{ secrets.CF_R2_SECRET_ACCESS_KEY2 }}
+          CF_R2_BUCKET_NAME2: ${{ secrets.CF_R2_BUCKET_NAME2 }}
+          CF_R2_ENDPOINT_URL2: ${{ secrets.CF_R2_ENDPOINT_URL2 }}
+        run: |
+          args=(
+            --prefix "${{ inputs.folder }}"
+            --workers "${{ inputs.workers }}"
+          )
+          [[ "${{ inputs.dry_run }}"       == "true" ]] && args+=(--dry-run)
+          [[ "${{ inputs.skip_existing }}" == "true" ]] && args+=(--skip-existing)
+
+          python scripts/mig_gcs_r2.py "${args[@]}"
